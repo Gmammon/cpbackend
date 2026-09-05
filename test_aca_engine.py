@@ -86,8 +86,8 @@ def test_session_budget_min_p_max_2p():
             break
 
     assert converged, "survey never converged within 20 rounds"
-    # min defaults to p=5, max to 2p=10: converge (stable) between p and 2p.
-    assert 5 <= rounds <= 10, f"expected p..2p = 5..10 rounds, got {rounds}"
+    # early_stop is OFF by default -> the survey always runs the full 2p = 10.
+    assert rounds == 10, f"expected full 2p = 10 rounds, got {rounds}"
 
     result = get_session_result(sid)
     utils = result['utilities']
@@ -102,6 +102,27 @@ def test_session_budget_min_p_max_2p():
     # ordering constraints hold for ordered attributes
     assert utils['品牌']['中'] <= utils['品牌']['高']
     assert utils['服务']['一般'] <= utils['服务']['好']
+
+
+def test_early_stop_enabled_stops_between_p_and_2p():
+    np.random.seed(13)
+    u_true = np.array([20.0, 30.0, 15.0, 10.0, 25.0])
+    sid = start_session('resp-es', attrs3, ub=100.0, early_stop=True)
+    q = start_aca_session(sid)
+    rounds = 0
+    converged = False
+    while rounds < 20:
+        diff = sessions[sid]['asked'][-1]
+        score = float(diff @ u_true)
+        rating = max(-100.0, min(100.0, score))
+        res = record_answer(sid, rating)
+        rounds += 1
+        if res['converged']:
+            converged = True
+            break
+    assert converged
+    # early_stop only fires after min=p=5 and before max=2p=10.
+    assert 5 <= rounds <= 10, f"expected p..2p = 5..10, got {rounds}"
 
 
 def test_inconsistent_responses_relax():

@@ -61,14 +61,17 @@ def start_session(respondent_id: str, attrs: list, ub: float = 100.0,
                   max_questions: int = None, min_questions: int = None,
                   convergence_threshold: float = 0.02,
                   consecutive_count: int = 3,
-                  survey_id: str = None, level_counts: list = None) -> str:
+                  survey_id: str = None, level_counts: list = None,
+                  early_stop: bool = False) -> str:
     """Create a new ACA session, return session_id.
 
     Question budget under baseline coding: p = number of utility parameters.
     min defaults to p (need ~one non-zero answer per parameter for the model
     to be identifiable); max defaults to 2p so noisy answers have room to
-    average out (paper: ~1.5-2x p in practice). Adaptive convergence
-    (threshold + consecutive stable rounds) can stop early between p and 2p.
+    average out (paper: ~1.5-2x p in practice). By default the survey runs
+    the full 2p questions (stable estimates); if early_stop is enabled, the
+    relative-stability rule (conv_threshold over conv_count rounds) may stop
+    it early between p and 2p.
     """
     p = total_params(attrs)
     session_id = uuid.uuid4().hex
@@ -90,6 +93,7 @@ def start_session(respondent_id: str, attrs: list, ub: float = 100.0,
         'max_questions': max_questions if max_questions is not None else 2 * p,
         'conv_threshold': convergence_threshold,
         'conv_count': consecutive_count,
+        'early_stop': early_stop,
         'state_stack': [],  # for undo support
     }
     return session_id
@@ -542,28 +546,30 @@ def record_answer(session_id: str, rating: float):
     sess['axis_index'] = 0
     sess['est_history'].append(est)
 
-    # Check convergence
+    # Adaptive early-stop is opt-in (off by default: surveys run the full max
+    # budget because the relative-stability rule can fire while the model is
+    # still underdetermined, leaving a biased estimate).
     converged = False
-    min_q = sess.get('min_questions', 3)
-    conv_threshold = sess.get('conv_threshold', 0.10)
-    conv_count = sess.get('conv_count', 2)
-
-    if len(sess['est_history']) >= min_q:
-        n_conv = 0
-        for i in range(len(sess['est_history']) - 1, 0, -1):
-            prev = sess['est_history'][i - 1]
-            curr = sess['est_history'][i]
-            t = np.sum(np.abs(curr))
-            if t > 0:
-                change = np.sum(np.abs(curr - prev)) / t
-                if change < conv_threshold:
-                    n_conv += 1
-                else:
-                    break
-        converged = n_conv >= conv_count
+    if sess.get('early_stop', False):
+        min_q = sess.get('min_questions', p)
+        conv_threshold = sess.get('conv_threshold', 0.02)
+        conv_count = sess.get('conv_count', 3)
+        if len(sess['est_history']) >= min_q:
+            n_conv = 0
+            for i in range(len(sess['est_history']) - 1, 0, -1):
+                prev = sess['est_history'][i - 1]
+                curr = sess['est_history'][i]
+                t = np.sum(np.abs(curr))
+                if t > 0:
+                    change = np.sum(np.abs(curr - prev)) / t
+                    if change < conv_threshold:
+                        n_conv += 1
+                    else:
+                        break
+            converged = n_conv >= conv_count
 
     # Max questions check
-    max_q = sess.get('max_questions', p)
+    max_q = sess.get('max_questions', 2 * p)
     if sess['round'] >= max_q:
         converged = True
 

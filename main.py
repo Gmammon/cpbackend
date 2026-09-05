@@ -140,6 +140,7 @@ class ACAStartRequest(BaseModel):
     convergence_threshold: float = 0.02
     consecutive_count: int = 3
     level_counts: Optional[list] = None
+    early_stop: bool = False
 
 
 class ACAAnswerRequest(BaseModel):
@@ -167,6 +168,7 @@ def aca_start(req: ACAStartRequest):
             convergence_threshold=req.convergence_threshold,
             consecutive_count=req.consecutive_count,
             survey_id=req.survey_id, level_counts=req.level_counts,
+            early_stop=req.early_stop,
         )
         question = start_aca_session(session_id)
         return {"session_id": session_id, "question": question}
