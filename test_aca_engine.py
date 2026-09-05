@@ -64,7 +64,7 @@ def test_first_question_prefers_low_frequency():
     assert hits >= 18, f"'H' only shown {hits}/20 times"
 
 
-def test_session_runs_exactly_p_questions():
+def test_session_budget_min_p_max_2p():
     np.random.seed(11)
     # True gains-over-baseline; small enough that |diff @ u| never exceeds 100,
     # so the constraint set stays feasible and the analytic center is used.
@@ -86,8 +86,8 @@ def test_session_runs_exactly_p_questions():
             break
 
     assert converged, "survey never converged within 20 rounds"
-    # min = max = p = 5 -> the survey always runs exactly 5 questions
-    assert rounds == 5, f"expected p=5 questions, got {rounds}"
+    # min defaults to p=5, max to 2p=10: converge (stable) between p and 2p.
+    assert 5 <= rounds <= 10, f"expected p..2p = 5..10 rounds, got {rounds}"
 
     result = get_session_result(sid)
     utils = result['utilities']

@@ -64,10 +64,11 @@ def start_session(respondent_id: str, attrs: list, ub: float = 100.0,
                   survey_id: str = None, level_counts: list = None) -> str:
     """Create a new ACA session, return session_id.
 
-    Question budget defaults to p (the number of utility parameters under
-    baseline coding). Both min and max default to p, so a survey runs exactly
-    p questions unless explicitly overridden; adaptive convergence still
-    applies when a smaller min/max is configured.
+    Question budget under baseline coding: p = number of utility parameters.
+    min defaults to p (need ~one non-zero answer per parameter for the model
+    to be identifiable); max defaults to 2p so noisy answers have room to
+    average out (paper: ~1.5-2x p in practice). Adaptive convergence
+    (threshold + consecutive stable rounds) can stop early between p and 2p.
     """
     p = total_params(attrs)
     session_id = uuid.uuid4().hex
@@ -85,8 +86,8 @@ def start_session(respondent_id: str, attrs: list, ub: float = 100.0,
         'last_active': time.time(),
         'round': 0,
         'est_history': [],
-        'max_questions': max_questions if max_questions is not None else p,
         'min_questions': min_questions if min_questions is not None else p,
+        'max_questions': max_questions if max_questions is not None else 2 * p,
         'conv_threshold': convergence_threshold,
         'conv_count': consecutive_count,
         'state_stack': [],  # for undo support
@@ -227,7 +228,8 @@ def _validate_card(attrs, card):
         idx += len(attr['levels']) - 1
 
 
-def gen_card_pair(attrs, axis=None, exclude=None, level_counts=None, max_changes=3):
+def gen_card_pair(attrs, axis=None, exclude=None, level_counts=None, max_changes=3,
+                  est=None):
     """Generate an optimal card pair.
 
     - axis (post first round): pick extreme levels along the longest
@@ -235,6 +237,10 @@ def gen_card_pair(attrs, axis=None, exclude=None, level_counts=None, max_changes
       `max_changes` attributes differ (cognitive-load constraint, paper p.10).
     - level_counts (first question): favour infrequently-shown levels.
     - exclude: avoid repeats of previously asked card pairs.
+    - est (current analytic center): light anti-dominance — when the center is
+      available, skip questions where one card is strictly better on EVERY
+      changed attribute (too predictable, little information, paper p.10 note).
+      If no non-dominated candidate is found, fall back to the best found.
     At least 2 attributes must differ between the two cards.
     """
     n_a = len(attrs)
@@ -245,6 +251,7 @@ def gen_card_pair(attrs, axis=None, exclude=None, level_counts=None, max_changes
         off += len(attr['levels']) - 1
 
     best, best_s = None, -1e20
+    best_fair, best_fair_s = None, -1e20
     max_allowed = min(max_changes, n_a)
     for _ in range(300):
         # Pick which attributes differ (2..max_changes). Under an axis,
@@ -271,9 +278,22 @@ def gen_card_pair(attrs, axis=None, exclude=None, level_counts=None, max_changes
             k = len(attr['levels'])
             if i in chg:
                 if axis is not None:
+                    # Paper step-2 mapping: a changed attribute compares one
+                    # non-baseline level against the baseline (level 0). Pick
+                    # the level whose axis component is strongest (param index j
+                    # maps to level j+1 — baseline is not a parameter), and
+                    # choose at random which card carries it. Randomising the
+                    # side anchors the baseline, reaches the best level, lets
+                    # 2-level attributes vary, and avoids a single card always
+                    # dominating (see also the est-based dominance filter below).
                     seg = axis[offsets[i]:offsets[i] + k - 1]
-                    la.append(np.argmax(seg + np.random.randn(k - 1) * 0.5))
-                    lb.append(np.argmin(seg + np.random.randn(k - 1) * 0.5))
+                    hi = int(np.argmax(seg + np.random.randn(k - 1) * 0.5)) + 1
+                    if np.random.rand() < 0.5:
+                        la.append(hi)
+                        lb.append(0)
+                    else:
+                        la.append(0)
+                        lb.append(hi)
                 elif level_counts is not None:
                     counts = np.asarray(level_counts[i], dtype=float) if len(level_counts) > i else np.zeros(k)
                     p_ = 1.0 / (counts + 1.0)
@@ -293,7 +313,7 @@ def gen_card_pair(attrs, axis=None, exclude=None, level_counts=None, max_changes
                 # Unchanged attributes show the same level on both cards.
                 if axis is not None:
                     seg = axis[offsets[i]:offsets[i] + k - 1]
-                    lv = np.argmax(seg + np.random.randn(k - 1) * 0.5)
+                    lv = int(np.argmax(seg + np.random.randn(k - 1) * 0.5)) + 1
                 elif level_counts is not None:
                     counts = np.asarray(level_counts[i], dtype=float) if len(level_counts) > i else np.zeros(k)
                     p_ = 1.0 / (counts + 1.0)
@@ -314,8 +334,28 @@ def gen_card_pair(attrs, axis=None, exclude=None, level_counts=None, max_changes
         if exclude and any(np.linalg.norm(diff - ex) < 0.1 or np.linalg.norm(diff + ex) < 0.1 for ex in exclude):
             continue
         s = abs(diff @ axis) if axis is not None else np.random.rand()
+        # Light anti-dominance: reject questions where one card is strictly
+        # better on EVERY changed attribute (answer too predictable).
+        dominated = False
+        if est is not None:
+            n_changed = sum(1 for i in range(n_a) if la[i] != lb[i])
+            a_side = sum(
+                1 for i in range(n_a) if la[i] != lb[i]
+                and (0.0 if la[i] == 0 else float(est[offsets[i] + la[i] - 1]))
+                > (0.0 if lb[i] == 0 else float(est[offsets[i] + lb[i] - 1]))
+            )
+            b_side = sum(
+                1 for i in range(n_a) if la[i] != lb[i]
+                and (0.0 if lb[i] == 0 else float(est[offsets[i] + lb[i] - 1]))
+                > (0.0 if la[i] == 0 else float(est[offsets[i] + la[i] - 1]))
+            )
+            dominated = a_side == n_changed or b_side == n_changed
         if s > best_s:
             best_s, best = s, (diff, la, lb)
+        if not dominated and s > best_fair_s:
+            best_fair_s, best_fair = s, (diff, la, lb)
+    if best_fair is not None:
+        best = best_fair
     if best is None:
         la = [np.random.randint(len(a['levels'])) for a in attrs]
         lb = [np.random.randint(len(a['levels'])) for a in attrs]
@@ -464,7 +504,8 @@ def record_answer(session_id: str, rating: float):
         else:
             axis = None
 
-        diff, la, lb = gen_card_pair(attrs, axis=axis, exclude=sess['asked'])
+        cur_est = sess['est_history'][-1] if sess['est_history'] else None
+        diff, la, lb = gen_card_pair(attrs, axis=axis, exclude=sess['asked'], est=cur_est)
         sess['asked'].append(diff.copy())
 
         if sess['est_history']:
@@ -544,7 +585,7 @@ def record_answer(session_id: str, rating: float):
         diff, la, lb = gen_card_pair(attrs, exclude=sess['asked'])
     else:
         axis = result['axes'][0]
-        diff, la, lb = gen_card_pair(attrs, axis=axis, exclude=sess['asked'])
+        diff, la, lb = gen_card_pair(attrs, axis=axis, exclude=sess['asked'], est=est)
     sess['asked'].append(diff.copy())
 
     utilities, importance = format_est(est, attrs)
@@ -587,7 +628,8 @@ def undo_last_answer(session_id: str) -> dict:
     else:
         axis = None
 
-    diff, la, lb = gen_card_pair(attrs, axis=axis, exclude=sess['asked'])
+    cur_est = sess['est_history'][-1] if sess['est_history'] else None
+    diff, la, lb = gen_card_pair(attrs, axis=axis, exclude=sess['asked'], est=cur_est)
     sess['asked'].append(diff.copy())
 
     if sess['est_history']:
